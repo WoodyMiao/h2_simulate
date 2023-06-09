@@ -7,38 +7,58 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from pysnptools.snpreader import Bed
-from multiprocessing import Pool
+from multiprocessing.dummy import Pool
 
-parser = argparse.ArgumentParser(description='Realize effect sizes and ')
+parser = argparse.ArgumentParser(description='Realize effect sizes and perform association tests')
 parser.add_argument('--out-dir', type=str, required=True, help='Directory for output files, same in all steps')
-parser.add_argument('--process', type=int, default=1, help='Number of processes running in parallel')
-parser.add_argument('--h2g-vals', type=str, default='1e-2,1e-3,1e-4', help='Target h2g values for the simulation')
-parser.add_argument('--pqtl-vals', type=str, default='1,0.1,0.01', help='Proprotion values of SNPs to be qtlal')
+parser.add_argument('--gene-list', type=str, default=None, help='File of a list of genes to be included')
+parser.add_argument('--nt', type=int, default=1, help='Number of threads running in parallel')
+parser.add_argument('--h2g-vals', type=str, default='1e-2,1e-3', help='Target h2g values for the simulation')
+parser.add_argument('--pqtl-vals', type=str, default='1.0,0.1', help='Proprotion values of SNPs to be qtlal')
 parser.add_argument('--neg-alpha-vals', type=str, default='0.25,1.0', help='Power values in the LDAK-Thin Model')
 parser.add_argument('--prevalence-vals', type=str, default='0.1,0.01',
-                    help='Prevalance values for the liability threshold modeling of dichotamous phenotypes')
+                    help='prevalence values for the liability threshold modeling of dichotamous phenotypes')
 parser.add_argument('--n-gwa', type=float, default=2e4, help='Size of a sample for association tests')
 parser.add_argument('--n-rep', type=float, default=100, help='Number of repititions')
+parser.add_argument('--hm3-only', action='store_true', default=False,
+                    help='Use only HapMap3 SNPs and prepend "hm3." to the output file names')
 
 args = parser.parse_args()
-n_gwa = int(float(args.n_gwa))
-n_rep = int(float(args.n_rep))
+n_gwa = int(args.n_gwa)
+n_rep = int(args.n_rep)
 out_dir = args.out_dir
 h2g_list = args.h2g_vals.split(',')
 pqtl_list = args.pqtl_vals.split(',')
 neg_alpha_list = args.neg_alpha_vals.split(',')
-prevalance_list = args.prevalence_vals.split(',')
-snp_counts = pd.read_csv(f'{out_dir}.snp_counts.tsv', sep='\t', index_col=0)
-snp_counts = snp_counts[snp_counts.allSNP > 0]
+prevalence_list = args.prevalence_vals.split(',')
+
+if not args.gene_list:
+    snp_counts = pd.read_csv(f'{args.out_dir}.snp_counts.tsv', sep='\t', index_col=0)
+    if not args.hm3_only:
+        gene_list = snp_counts.loc[snp_counts.allSNP >= 3].index.values
+    else:
+        gene_list = snp_counts.loc[snp_counts.hm3SNP >= 3].index.values
+else:
+    gene_list = np.loadtxt(args.gene_list, dtype=str)
 
 
 def process_one_gene(gene):
+    dir_gene = f'{out_dir}/{gene}'
+
     # Read plink.bim and plink.fam
-    plink_bim = pd.read_csv(f'{out_dir}/{gene}/plink.bim', sep='\t', header=None)
+    plink_bim = pd.read_csv(f'{dir_gene}/plink.bim', sep='\t', header=None)
     plink_bim.columns = ['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2']
 
     # Read genotypes and calculate MAF
-    snpdata = Bed(f'{out_dir}/{gene}/plink', count_A1=True).read()
+    snp_on_disk = Bed(f'{dir_gene}/plink', count_A1=True)
+
+    if args.hm3_only:
+        hm3snp = np.loadtxt(f'{dir_gene}/plink.hm3snp', dtype=str)
+        is_hm3snp = plink_bim.SNP.isin(hm3snp)
+        plink_bim = plink_bim[is_hm3snp]
+        snp_on_disk = snp_on_disk[:, is_hm3snp]
+
+    snpdata = snp_on_disk.read()
     frq_A1 = np.mean(snpdata.val, axis=0) / 2
 
     # Standardize genotypes
@@ -52,10 +72,10 @@ def process_one_gene(gene):
     columns = pd.MultiIndex.from_product((pqtl_list, neg_alpha_list, h2g_list))
     realized_beta = pd.DataFrame(dtype=float, index=np.arange(m), columns=columns)
     realized_beta.columns.names = ['prop_qtl', 'neg_alpha', 'target_h2']
-    realized_h2 = pd.DataFrame(dtype=float, index=[gene], columns=columns)
-    realized_h2.columns.names = ['prop_qtl', 'neg_alpha', 'target_h2']
+    realized_h2_ = pd.DataFrame(dtype=float, index=[gene], columns=columns)
+    realized_h2_.columns.names = ['prop_qtl', 'neg_alpha', 'target_h2']
 
-    columns = pd.MultiIndex.from_product((pqtl_list, neg_alpha_list, h2g_list, ['cont'] + prevalance_list))
+    columns = pd.MultiIndex.from_product((pqtl_list, neg_alpha_list, h2g_list, ['cont'] + prevalence_list))
     phenotypes = pd.DataFrame(-9, dtype=np.int8, index=snpdata.iid[:, 0], columns=columns)
     phenotypes.columns.names = ['prop_qtl', 'neg_alpha', 'target_h2', 'prevalence']
     for pqtl in pqtl_list:
@@ -75,10 +95,10 @@ def process_one_gene(gene):
                 # Calculate phenotypes and realized h2g
                 y_norm = genetic_eff_scale_h2g + np.random.normal(0, np.sqrt(1 - float(h2g)), n_pop)
                 realized_beta[(pqtl, neg_alpha, h2g)] = beta * scale_factor
-                realized_h2[(pqtl, neg_alpha, h2g)] = genetic_eff_scale_h2g.var() / y_norm.var()
+                realized_h2_[(pqtl, neg_alpha, h2g)] = genetic_eff_scale_h2g.var() / y_norm.var()
 
-                thresholds = norm.isf(np.float64(prevalance_list))
-                phenotypes.loc[:, (pqtl, neg_alpha, h2g, prevalance_list)] = np.int8(y_norm[:, None] > thresholds) + 1
+                thresholds = norm.isf(np.float64(prevalence_list))
+                phenotypes.loc[:, (pqtl, neg_alpha, h2g, prevalence_list)] = np.int8(y_norm[:, None] > thresholds) + 1
                 phenotypes[(pqtl, neg_alpha, h2g, 'cont')] = y_norm
                 # Perform association tests
                 y_test = y_norm[:tot_n_gwa].reshape(n_rep, n_gwa, 1)
@@ -86,11 +106,14 @@ def process_one_gene(gene):
                 p = norm.sf(np.abs(z)) * 2
 
                 for j in range(n_rep):
-                    dir_rep = f'{out_dir}/{gene}/rep{j}'
+                    if args.hm3_only:
+                        out_pre = f'{dir_gene}/rep{j}/hm3.pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}'
+                    else:
+                        out_pre = f'{dir_gene}/rep{j}/pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}'
 
                     # Write phenotypes of the sample
                     pd.DataFrame(y_test[j], index=pd.MultiIndex.from_arrays(iid_gwa[j].T)).to_csv(
-                        f'{dir_rep}/pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}.pheno', sep=' ', header=False)
+                        f'{out_pre}.pheno', sep=' ', header=False)
 
                     # Write a summary statistic file for KGGSEE, HESS, and LDSC
                     sumstat = plink_bim.copy()
@@ -98,24 +121,33 @@ def process_one_gene(gene):
                     sumstat['N'] = n_gwa
                     sumstat['P'] = p[j]
                     sumstat[['CHR', 'BP', 'P', 'SNP', 'A1', 'A2', 'Z', 'N']] \
-                        .to_csv(f'{dir_rep}/pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}.sumstat.gz', sep='\t', index=False)
+                        .to_csv(f'{out_pre}.sumstat.gz', sep='\t', index=False)
 
                     # Write a summary statistic file for LDER
                     sumstat.rename({'SNP': 'snp', 'CHR': 'chr', 'A1': 'a0', 'A2': 'a1', 'Z': 'z'}, axis=1)[
                         ['snp', 'chr', 'a0', 'a1', 'z']].to_csv(
-                        f'{dir_rep}/pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}.lder.sumstat.gz', sep='\t', index=False)
+                        f'{out_pre}.lder.sumstat.gz', sep='\t', index=False)
 
                     # Write a summary statistic file for LDAK
                     sumstat.rename({'SNP': 'Predictor', 'N': 'n'}, axis=1)[['Predictor', 'A1', 'A2', 'n', 'Z']] \
-                        .to_csv(f'{dir_rep}/pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}.ldak.sumstat', sep='\t', index=False)
+                        .to_csv(f'{out_pre}.ldak.sumstat', sep='\t', index=False)
 
-    realized_beta.to_csv(f'{out_dir}/{gene}/realized_effect_sizes.tsv', sep='\t')
-    phenotypes.to_csv(f'{out_dir}/{gene}/realized_phenotypes.tsv', sep='\t')
+    if args.hm3_only:
+        realized_beta.to_csv(f'{dir_gene}/hm3.realized_effect_sizes.tsv', sep='\t')
+        phenotypes.to_csv(f'{dir_gene}/hm3.realized_phenotypes.tsv', sep='\t')
+    else:
+        realized_beta.to_csv(f'{dir_gene}/realized_effect_sizes.tsv', sep='\t')
+        phenotypes.to_csv(f'{dir_gene}/realized_phenotypes.tsv', sep='\t')
+
     logging.info(f'Done {gene}.')
-    return realized_h2
+    return realized_h2_
 
 
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logging.info(f'Getting started at {time.strftime("%d %b %Y %H:%M:%S", time.localtime())}')
-pd.concat(Pool(args.process).map(process_one_gene, snp_counts.index)).to_csv(f'{out_dir}.realized_h2.tsv', sep='\t')
+realized_h2 = pd.concat(Pool(args.nt).map(process_one_gene, gene_list))
+if args.hm3_only:
+    realized_h2.to_csv(f'{out_dir}.hm3.realized_h2.tsv', sep='\t')
+else:
+    realized_h2.to_csv(f'{out_dir}.realized_h2.tsv', sep='\t')
 logging.info(f'Done at {time.strftime("%d %b %Y %H:%M:%S", time.localtime())}')

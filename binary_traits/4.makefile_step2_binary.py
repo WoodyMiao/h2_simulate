@@ -21,19 +21,15 @@ parser = argparse.ArgumentParser(description='Make shell scripts of h2 estamatin
 parser.add_argument('--out-dir', type=str, required=True, help='Directory for output files, same in all steps')
 parser.add_argument('--gene-list', type=str, default=None, help='File of a list of genes to be included')
 parser.add_argument('--chrom', type=str, required=True, help='The chromosome where the data from')
-parser.add_argument('--n-gwa', type=float, default=5e3, help='Size of a sample for association tests')
-parser.add_argument('--n-ld', type=str, default=None, help='Sizes of samples for LD panels')
+parser.add_argument('--n-gwa', type=float, default=2e4, help='Size of a sample for association tests')
+parser.add_argument('--n-ld', type=str, default='5e2,2e3', help='Sizes of samples for LD panels')
 parser.add_argument('--n-rep', type=float, default=100, help='Size of a sample for association tests')
-parser.add_argument('--h2g-vals', type=str, default='1e-2,1e-3', help='Target h2g values for the simulation')
-parser.add_argument('--pqtl-vals', type=str, default='1.0,0.1', help='Proprotion values of SNPs to be QTLs')
-parser.add_argument('--neg-alpha-vals', type=str, default='0.25,1.0', help='Power values in the LDAK-Thin Model')
+parser.add_argument('--h2g', type=float, default=1e-3, help='Target h2g for the simulation')
 parser.add_argument('--maf-min', type=float, default=0.01, help='Ignore SNPs with MAF < MAF_MIN')
-parser.add_argument('--hm3-h2', action='store_true', default=False,
-                    help='Use summary statistics calculated from genetic models containing all SNPs '
-                         'but estimate h2 with only HapMap3 SNPs, and insert "hm3_" to the output file names')
-parser.add_argument('--hm3-only', action='store_true', default=False,
-                    help='Use only HapMap3 SNPs and prepend "hm3." to the output directory names')
-parser.add_argument('--gcta', action='store_true', default=False, help='Write shell scripts to run GCTA')
+parser.add_argument('--neg-alpha', type=float, default=0.25, help='Power value in the LDAK-Thin Model')
+parser.add_argument('--pqtl-vals', type=str, default='1,0.1,0.01', help='Proprotion values of SNPs to be qtlal')
+parser.add_argument('--prevalence-vals', type=str, default='0.1,0.01',
+                    help='prevalence values for the liability threshold modeling of dichotamous phenotypes')
 parser.add_argument('--hess', action='store_true', default=False, help='Write shell scripts to run HESS')
 parser.add_argument('--kggsee', action='store_true', default=False, help='Write shell scripts to run KGGSEE')
 parser.add_argument('--ldak-gbat', action='store_true', default=False, help='Write shell scripts to run LDAK-GBAT')
@@ -43,35 +39,22 @@ parser.add_argument('--ldsc', action='store_true', default=False, help='Write sh
 parser.add_argument('--skip-mkdir', action='store_true', default=False, help='Skip the commands of mkdir')
 parser.add_argument('--makefile-only', action='store_true', default=False, help='Only remake makefiles')
 parser.add_argument('--jobs', type=int, default=100, help='The number jobs for the GNU make to run simultaneously')
-parser.add_argument('--skip-assoc-ld', action='store_true', default=False,
-                    help='Skip commands on LD matrices calculated from samples of association tests')
-parser.add_argument('--old-suffix', action='store_true', default=False, help='To be compatible with old runs')
+parser.add_argument('--assoc-test', type=str, default='logit',
+                    help='chi2|linear|logit, part of the suffix of the input files.')
 
 args = parser.parse_args()
+h2g = args.h2g
+alpha = -args.neg_alpha
+maf_min = args.maf_min
 n_gwa = int(args.n_gwa)
-if args.skip_assoc_ld:
-    n_lst = []
-    ld_sfx = []
-else:
-    n_lst = [n_gwa]
-    ld_sfx = ['gwa']
-
-if args.n_ld:
-    n_ld_str = args.n_ld.split(',')
-    n_lst += [int(float(n)) for n in n_ld_str]
-    if args.old_suffix:
-        ld_sfx += ['ld1', 'ld2']
-    else:
-        ld_sfx += [f'ld{n}' for n in n_ld_str]
-
-if args.hm3_h2 or args.hm3_only:
-    ld_sfx = [f'hm3_{a}' for a in ld_sfx]
-
+n_case = int(n_gwa / 2)
 n_rep = int(args.n_rep)
-h2g_list = args.h2g_vals.split(',')
-pqtl_list = args.pqtl_vals.split(',')
-neg_alpha_list = args.neg_alpha_vals.split(',')
-par_tup_list = list(product(pqtl_list, neg_alpha_list, h2g_list))
+n_ld_str = args.n_ld.split(',')
+n_ld_int = [int(float(n)) for n in n_ld_str]
+ld_sfx = [f'ld{n}' for n in args.n_ld.split(',')]
+pqtl_lst = args.pqtl_vals.split(',')
+prevalence_lst = args.prevalence_vals.split(',')
+par_tup_list = list(product(prevalence_lst, pqtl_lst))
 
 if not args.gene_list:
     snp_counts = pd.read_csv(f'{args.out_dir}.snp_counts.tsv', sep='\t', index_col=0)
@@ -79,12 +62,7 @@ if not args.gene_list:
 else:
     gene_list = np.loadtxt(args.gene_list, dtype=str)
 
-# If GCTA is too slow, take a subset of genes.
-gene_list_gcta = gene_list
-
 methods = list()
-if args.gcta:
-    methods.append('gcta')
 if args.kggsee:
     methods.append('kggsee')
 if args.hess:
@@ -102,16 +80,14 @@ logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logging.info(f'Getting started at {time.strftime("%d %b %Y %H:%M:%S", time.localtime())}')
 
 
-def one_parameter_set_makefile(pqtl_negalpha_h2g):
-    pqtl, neg_alpha, h2g = pqtl_negalpha_h2g
-    par_str = f'pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g}'
-    if args.hm3_only:
-        par_str = 'hm3.' + par_str
+def one_parameter_set_makefile(prvl_pqtl):
+    prvl, pqtl = prvl_pqtl
+    par_str = f'prvl{prvl}_pqtl{pqtl}_alpha{alpha}.{args.assoc_test}'
 
     if not args.makefile_only:
 
         for j in range(n_rep):
-            logging.info(f'Processing commands for pqtl{pqtl}_alpha-{neg_alpha}_h2g{h2g} rep{j} ...')
+            logging.info(f'Processing commands for {par_str} rep{j} ...')
 
             for gene in gene_list:
                 dir_gene = f'{args.out_dir}/{gene}'
@@ -121,16 +97,10 @@ def one_parameter_set_makefile(pqtl_negalpha_h2g):
                 if not args.skip_mkdir:
                     os.system(f'mkdir -p {dir_out}')
 
-                if args.gcta:
-                    if gene in gene_list_gcta:
-                        with open(f'{dir_out}/gcta.sh', 'w') as o:
-                            print(f'{gcta_exe} --reml --pheno {dir_rep}/{par_str}.pheno '
-                                  f'--grm {dir_rep}/gcta --out {dir_out}/gcta >/dev/null 2>&1\n', file=o)
-
                 if args.kggsee:
                     with open(f'{dir_out}/kggsee.sh', 'w') as o:
                         for k in ld_sfx:
-                            print(f'{kggsee_exe} --filter-maf-le {args.maf_min} --gene-herit '
+                            print(f'{kggsee_exe} --filter-maf-le {maf_min} --gene-herit '
                                   f'--vcf-ref {dir_rep}/plink_{k}.vcf.gz --sum-file {dir_rep}/{par_str}.sumstat.gz '
                                   f'--nmiss-col N --regions-bed {dir_gene}/region.kggsee '
                                   f'--out {dir_out}/kggsee_{k} >/dev/null 2>&1\n', file=o)
@@ -138,7 +108,7 @@ def one_parameter_set_makefile(pqtl_negalpha_h2g):
                 if args.hess:
                     with open(f'{dir_out}/hess.sh', 'w') as o:
                         for k in ld_sfx:
-                            print(f'{hess_exe} --min-maf {args.maf_min} '
+                            print(f'{hess_exe} --min-maf {maf_min} '
                                   f'--local-hsqg {dir_rep}/{par_str}.sumstat.gz --chrom {args.chrom} '
                                   f'--bfile {dir_rep}/plink_{k} --partition {dir_gene}/region.hess '
                                   f'--out {dir_out}/hess_{k}.step1 >/dev/null 2>&1', file=o)
@@ -158,7 +128,7 @@ def one_parameter_set_makefile(pqtl_negalpha_h2g):
                         print(f'ln -fs ../../../../region.lder {dir_out}/plinkLD/ldetect-data/fourier_ls-all.bed\n',
                               file=o)
 
-                        for nld, k in zip(n_lst, ld_sfx):
+                        for nld, k in zip(n_ld_int, ld_sfx):
                             if k == 'gwa':
                                 insample = 'T'
                             else:
@@ -196,18 +166,11 @@ def one_parameter_set_makefile(pqtl_negalpha_h2g):
         logging.info(f'Writing {makefile} ...')
         target_final = f'{makefile}.done:'
         target_list = list()
-        if method_ == 'gcta':
-            for j in range(n_rep):
-                for gene in gene_list_gcta:
-                    target_final += f' {gene}rep{j}'
-                    target_list.append(
-                        f'{gene}rep{j}:\n\tsh {args.out_dir}/{gene}/rep{j}/{par_str}/{method_}.sh\n')
-        else:
-            for j in range(n_rep):
-                for gene in gene_list:
-                    target_final += f' {gene}rep{j}'
-                    target_list.append(
-                        f'{gene}rep{j}:\n\tsh {args.out_dir}/{gene}/rep{j}/{par_str}/{method_}.sh\n')
+        for j in range(n_rep):
+            for gene in gene_list:
+                target_final += f' {gene}rep{j}'
+                target_list.append(
+                    f'{gene}rep{j}:\n\tsh {args.out_dir}/{gene}/rep{j}/{par_str}/{method_}.sh\n')
 
         target_final += f'\n\ttouch {makefile}.done\n'
         with open(makefile, 'w') as o:
@@ -221,7 +184,7 @@ def one_parameter_set_makefile(pqtl_negalpha_h2g):
 
 list_of_dict = Pool(len(par_tup_list)).map(one_parameter_set_makefile, par_tup_list)
 for method in methods:
-    with open(f'{args.out_dir}/makefile.step2.{method}.sh', 'w') as O:
+    with open(f'{args.out_dir}/makefile.step2.{args.assoc_test}.{method}.sh', 'w') as O:
         if method in ['hess', 'lder', 'ldsc']:
             O.write('''
 export MKL_NUM_THREADS=1
